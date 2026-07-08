@@ -17,6 +17,15 @@ target_link_libraries(batch_get_replica_bench PRIVATE cachelib_memory_allocator
 add_executable(file_interface_bench file_interface_bench.cpp)
 target_link_libraries(file_interface_bench PRIVATE mooncake_store glog::glog)
 
+# Add DFS backend benchmark executable
+add_executable(dfs_backend_bench dfs_backend_bench.cpp)
+target_link_libraries(dfs_backend_bench PRIVATE mooncake_store gflags::gflags
+                                                glog::glog pthread)
+if(USE_3FS)
+  target_include_directories(dfs_backend_bench
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/hf3fs/include)
+endif()
+
 # Add storage backend benchmark executable
 # This benchmark tests all storage backends (OffsetAllocator, Bucket, FilePerKey)
 # with realistic KV cache workloads for LLM inference scenarios

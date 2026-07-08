@@ -15,7 +15,13 @@ import time
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, List, Optional
-from mooncake.store import MooncakeDistributedStore, ReplicateConfig, get_alloc_func_addr, get_free_func_addr
+from mooncake.store import (
+    MooncakeDistributedStore,
+    ReplicaStatus,
+    ReplicateConfig,
+    get_alloc_func_addr,
+    get_free_func_addr,
+)
 
 
 LOG = logging.getLogger("store_kv_bench")
@@ -67,6 +73,32 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--memory-replica-num", type=int, default=1)
     parser.add_argument("--nof-replica-num", type=int, default=0)
+    parser.add_argument("--dfs-replica-num", type=int, default=0)
+    parser.add_argument(
+        "--wait-dfs-complete",
+        action="store_true",
+        help="After DFS writes, wait until every target key has a COMPLETE DFS replica.",
+    )
+    parser.add_argument(
+        "--force-dfs-read",
+        action="store_true",
+        help=(
+            "Before read phases, wait for DFS completion, wait for lease "
+            "expiry, then clear local MEMORY replicas."
+        ),
+    )
+    parser.add_argument(
+        "--dfs-complete-timeout-sec",
+        type=float,
+        default=60.0,
+        help="Timeout for DFS completion and local replica clear polling.",
+    )
+    parser.add_argument(
+        "--dfs-clear-delay-sec",
+        type=float,
+        default=1.0,
+        help="Delay after DFS completion before clearing local MEMORY replicas.",
+    )
 
     parser.add_argument("--verify", action="store_true")
     parser.add_argument("--pattern", default="")
@@ -191,6 +223,10 @@ class DatasetState:
         with self.ids_lock:
             return list(self.written_ids)
 
+    def snapshot_prepared_ids(self) -> List[int]:
+        with self.ids_lock:
+            return list(self.prepared_ids)
+
     def next_read_ids(
         self,
         count: int,
@@ -254,6 +290,14 @@ class StoreSession:
         self.config = ReplicateConfig()
         self.config.replica_num = args.memory_replica_num
         self.config.nof_replica_num = args.nof_replica_num
+        if args.dfs_replica_num > 0 and not hasattr(
+            self.config, "dfs_replica_num"
+        ):
+            raise RuntimeError(
+                "store binding does not expose ReplicateConfig.dfs_replica_num"
+            )
+        if hasattr(self.config, "dfs_replica_num"):
+            self.config.dfs_replica_num = args.dfs_replica_num
         self._zcopy = zcopy
 
     def close(self) -> None:
@@ -478,6 +522,7 @@ class StoreRuntime:
             args.protocol,
             args.device_name,
             args.master_server,
+            enable_ssd_offload=True,
         )
         if setup_ret != 0:
             raise RuntimeError(f"setup failed: {setup_ret}")
@@ -650,8 +695,40 @@ class BenchmarkRunner:
             raise ValueError("rwmixread must be within [0, 100]")
         if self.args.verify and not self.pattern:
             raise ValueError("verify mode currently requires --pattern")
-        if self.args.memory_replica_num == 0 and self.args.nof_replica_num == 0:
-            raise ValueError("memory_replica_num and nof_replica_num cannot both be 0")
+        if (
+            self.args.memory_replica_num < 0
+            or self.args.nof_replica_num < 0
+            or self.args.dfs_replica_num < 0
+        ):
+            raise ValueError("replica counts must be >= 0")
+        if self.args.dfs_replica_num > 1:
+            raise ValueError("dfs-replica-num currently supports 0 or 1")
+        if (
+            self.args.memory_replica_num == 0
+            and self.args.nof_replica_num == 0
+            and self.args.dfs_replica_num == 0
+        ):
+            raise ValueError(
+                "memory_replica_num, nof_replica_num, and dfs_replica_num "
+                "cannot all be 0"
+            )
+        if self.args.dfs_replica_num > 0 and self.args.memory_replica_num == 0:
+            raise ValueError("dfs-replica-num requires memory-replica-num > 0")
+        if self.args.wait_dfs_complete and self.args.dfs_replica_num == 0:
+            raise ValueError("wait-dfs-complete requires dfs-replica-num > 0")
+        if self.args.force_dfs_read and self.args.dfs_replica_num == 0:
+            raise ValueError("force-dfs-read requires dfs-replica-num > 0")
+        if self.args.force_dfs_read and (
+            self.args.memory_replica_num != 1 or self.args.nof_replica_num != 0
+        ):
+            raise ValueError(
+                "force-dfs-read expects memory-replica-num=1 and "
+                "nof-replica-num=0"
+            )
+        if self.args.dfs_complete_timeout_sec <= 0:
+            raise ValueError("dfs-complete-timeout-sec must be > 0")
+        if self.args.dfs_clear_delay_sec < 0:
+            raise ValueError("dfs-clear-delay-sec must be >= 0")
         if self.args.phase_gap_mode == "sleep" and self.args.phase_gap_sec <= 0:
             raise ValueError("phase-gap-sec must be > 0 when phase-gap-mode=sleep")
         if self.args.phase_gap_mode == "file" and not self.args.phase_gap_file:
@@ -748,6 +825,207 @@ class BenchmarkRunner:
         stats.bytes_processed += request.bytes_processed
         stats.error_counts.update(request.error_counts)
 
+    def _keys_for_ids(self, object_ids: List[int]) -> List[str]:
+        return [
+            make_key(self.args.key_prefix, self.args.key_size, object_id)
+            for object_id in object_ids
+        ]
+
+    def _store(self):
+        self._make_sessions()
+        assert self._runtime is not None
+        return self._runtime.store
+
+    def _query_replica_map(self, keys: List[str]) -> dict:
+        store = self._store()
+        result = {}
+        chunk_size = 1024
+        for offset in range(0, len(keys), chunk_size):
+            chunk = keys[offset : offset + chunk_size]
+            result.update(store.batch_get_replica_desc(chunk))
+        return result
+
+    def _is_complete_dfs_replica(self, replica) -> bool:
+        if getattr(replica, "status", None) != ReplicaStatus.COMPLETE:
+            return False
+        if not hasattr(replica, "is_dfs_replica"):
+            raise RuntimeError(
+                "store binding does not expose ReplicaDescriptor.is_dfs_replica"
+            )
+        return replica.is_dfs_replica()
+
+    def _has_complete_memory_replica(self, replica) -> bool:
+        return (
+            getattr(replica, "status", None) == ReplicaStatus.COMPLETE
+            and replica.is_memory_replica()
+        )
+
+    def _count_complete_dfs_keys(self, replica_map: dict, keys: List[str]) -> int:
+        complete = 0
+        for key in keys:
+            replicas = replica_map.get(key, [])
+            if any(self._is_complete_dfs_replica(replica) for replica in replicas):
+                complete += 1
+        return complete
+
+    def _count_keys_with_memory(self, replica_map: dict, keys: List[str]) -> int:
+        with_memory = 0
+        for key in keys:
+            replicas = replica_map.get(key, [])
+            if any(self._has_complete_memory_replica(replica) for replica in replicas):
+                with_memory += 1
+        return with_memory
+
+    def _make_wait_stats(
+        self,
+        name: str,
+        keys: List[str],
+        start: float,
+        end: float,
+        polls: int,
+        successful_kvs: int,
+        failed_kvs: int,
+    ) -> PhaseStats:
+        stats = PhaseStats(name=name)
+        stats.start_time = start
+        stats.end_time = end
+        stats.requests = polls
+        stats.successful_requests = 1 if failed_kvs == 0 else 0
+        stats.failed_requests = 0 if failed_kvs == 0 else 1
+        stats.kvs = len(keys)
+        stats.successful_kvs = successful_kvs
+        stats.failed_kvs = failed_kvs
+        stats.request_latencies.append(end - start)
+        if failed_kvs:
+            stats.error_counts["DFS_WAIT_INCOMPLETE"] += failed_kvs
+        return stats
+
+    def _wait_for_dfs_complete(
+        self, object_ids: List[int], phase_name: str
+    ) -> PhaseStats:
+        unique_ids = list(dict.fromkeys(object_ids))
+        if not unique_ids:
+            raise RuntimeError(
+                f"{phase_name}: no object ids available for DFS completion wait"
+            )
+        keys = self._keys_for_ids(unique_ids)
+        deadline = time.time() + self.args.dfs_complete_timeout_sec
+        start = time.perf_counter()
+        polls = 0
+        complete = 0
+
+        while True:
+            replica_map = self._query_replica_map(keys)
+            polls += 1
+            complete = self._count_complete_dfs_keys(replica_map, keys)
+            if complete == len(keys):
+                end = time.perf_counter()
+                stats = self._make_wait_stats(
+                    phase_name, keys, start, end, polls, complete, 0
+                )
+                LOG.info(
+                    "DFS replicas complete for %d keys after %.3fs (%d polls)",
+                    len(keys),
+                    end - start,
+                    polls,
+                )
+                log_phase_stats(stats)
+                return stats
+            if time.time() >= deadline:
+                end = time.perf_counter()
+                failed = len(keys) - complete
+                stats = self._make_wait_stats(
+                    phase_name, keys, start, end, polls, complete, failed
+                )
+                log_phase_stats(stats)
+                raise TimeoutError(
+                    f"{phase_name}: timed out waiting for DFS replicas: "
+                    f"complete={complete}/{len(keys)}"
+                )
+            time.sleep(0.2)
+
+    def _clear_local_memory_replicas(
+        self, object_ids: List[int], phase_name: str
+    ) -> PhaseStats:
+        unique_ids = list(dict.fromkeys(object_ids))
+        if not unique_ids:
+            raise RuntimeError(
+                f"{phase_name}: no object ids available for local replica clear"
+            )
+        keys = self._keys_for_ids(unique_ids)
+        store = self._store()
+        hostname = store.get_hostname()
+        deadline = time.time() + self.args.dfs_complete_timeout_sec
+        start = time.perf_counter()
+        polls = 0
+        remaining = len(keys)
+
+        while True:
+            cleared = set(store.batch_replica_clear(keys, segment_name=hostname))
+            replica_map = self._query_replica_map(keys)
+            polls += 1
+            remaining = self._count_keys_with_memory(replica_map, keys)
+            dfs_complete = self._count_complete_dfs_keys(replica_map, keys)
+            if remaining == 0 and dfs_complete == len(keys):
+                end = time.perf_counter()
+                stats = self._make_wait_stats(
+                    phase_name, keys, start, end, polls, len(keys), 0
+                )
+                LOG.info(
+                    "cleared local MEMORY replicas for %d keys on segment %s "
+                    "after %.3fs (%d polls, last_clear=%d)",
+                    len(keys),
+                    hostname,
+                    end - start,
+                    polls,
+                    len(cleared),
+                )
+                log_phase_stats(stats)
+                return stats
+            if time.time() >= deadline:
+                end = time.perf_counter()
+                failed = max(remaining, len(keys) - dfs_complete)
+                stats = self._make_wait_stats(
+                    phase_name,
+                    keys,
+                    start,
+                    end,
+                    polls,
+                    len(keys) - failed,
+                    failed,
+                )
+                stats.error_counts["MEMORY_REPLICA_REMAINING"] += remaining
+                log_phase_stats(stats)
+                raise TimeoutError(
+                    f"{phase_name}: timed out clearing local MEMORY replicas: "
+                    f"remaining_memory={remaining}, dfs_complete={dfs_complete}/{len(keys)}"
+                )
+            time.sleep(0.2)
+
+    def _prepare_dfs_read_path(
+        self, object_ids: List[int], label: str
+    ) -> List[PhaseStats]:
+        phases: List[PhaseStats] = []
+        if self.args.force_dfs_read:
+            phases.append(
+                self._wait_for_dfs_complete(object_ids, f"dfs_complete_{label}")
+            )
+            if self.args.dfs_clear_delay_sec > 0:
+                LOG.info(
+                    "sleeping %.3fs before clearing local MEMORY replicas for %s",
+                    self.args.dfs_clear_delay_sec,
+                    label,
+                )
+                time.sleep(self.args.dfs_clear_delay_sec)
+            phases.append(
+                self._clear_local_memory_replicas(object_ids, f"dfs_clear_{label}")
+            )
+        elif self.args.wait_dfs_complete:
+            phases.append(
+                self._wait_for_dfs_complete(object_ids, f"dfs_complete_{label}")
+            )
+        return phases
+
     def _run_fixed_write(
         self,
         phase_name: str,
@@ -787,13 +1065,18 @@ class BenchmarkRunner:
         return stats
 
     def _run_time_based_write(self, phase_name: str, total_objects: int) -> PhaseStats:
-        deadline = time.time() + self.args.runtime
         write_upper = self.dataset.next_write_id + total_objects
         stop_event = threading.Event()
+        start_barrier = threading.Barrier(self.lane_count)
 
         def worker(session: StoreSession, _lane_id: int) -> Callable[[PhaseStats], None]:
             def run(stats: PhaseStats) -> None:
-                while time.time() < deadline and not stop_event.is_set():
+                # _run_threads creates the Store runtime before it starts the
+                # workers.  Start the timed interval only after every worker
+                # is ready, so client setup does not shorten a nominal run.
+                start_barrier.wait()
+                deadline = time.monotonic() + self.args.runtime
+                while time.monotonic() < deadline and not stop_event.is_set():
                     object_ids = self.dataset.reserve_write_ids(self.args.batch_size, write_upper)
                     if not object_ids:
                         stats.dataset_exhausted = True
@@ -820,13 +1103,15 @@ class BenchmarkRunner:
     ) -> PhaseStats:
         seed_base = self.args.rand_seed
         if runtime_sec > 0:
-            deadline = time.time() + runtime_sec
+            start_barrier = threading.Barrier(self.lane_count)
 
             def worker(session: StoreSession, lane_id: int) -> Callable[[PhaseStats], None]:
                 rng = random.Random(seed_base + lane_id)
 
                 def run(stats: PhaseStats) -> None:
-                    while time.time() < deadline:
+                    start_barrier.wait()
+                    deadline = time.monotonic() + runtime_sec
+                    while time.monotonic() < deadline:
                         object_ids = self.dataset.next_read_ids(
                             self.args.batch_size,
                             loop=True,
@@ -870,16 +1155,18 @@ class BenchmarkRunner:
         return self._run_threads(phase_name, worker)
 
     def _run_mixed_phase(self, phase_name: str, extra_write_budget: int) -> PhaseStats:
-        deadline = time.time() + self.args.runtime
         write_upper = self.dataset.next_write_id + extra_write_budget
         stop_event = threading.Event()
+        start_barrier = threading.Barrier(self.lane_count)
         seed_base = self.args.rand_seed
 
         def worker(session: StoreSession, lane_id: int) -> Callable[[PhaseStats], None]:
             rng = random.Random(seed_base + lane_id)
 
             def run(stats: PhaseStats) -> None:
-                while time.time() < deadline and not stop_event.is_set():
+                start_barrier.wait()
+                deadline = time.monotonic() + self.args.runtime
+                while time.monotonic() < deadline and not stop_event.is_set():
                     do_read = rng.randrange(100) < self.args.rwmixread
                     if do_read:
                         object_ids = self.dataset.next_read_ids(
@@ -929,7 +1216,11 @@ class BenchmarkRunner:
 
     def run(self) -> List[PhaseStats]:
         LOG.info(
-            "scenario=%s io_api=%s numjobs=%d iodepth=%d lanes=%d batch_size=%d value_size=%d nr_objects=%d prepare_objects=%d write_objects=%d memory_replica_num=%d nof_replica_num=%d verify=%s",
+            "scenario=%s io_api=%s numjobs=%d iodepth=%d lanes=%d "
+            "batch_size=%d value_size=%d nr_objects=%d prepare_objects=%d "
+            "write_objects=%d memory_replica_num=%d nof_replica_num=%d "
+            "dfs_replica_num=%d wait_dfs_complete=%s force_dfs_read=%s "
+            "verify=%s",
             self.args.scenario,
             self.args.io_api,
             self.args.numjobs,
@@ -942,6 +1233,9 @@ class BenchmarkRunner:
             self.args.write_objects,
             self.args.memory_replica_num,
             self.args.nof_replica_num,
+            self.args.dfs_replica_num,
+            self.args.wait_dfs_complete,
+            self.args.force_dfs_read,
             self.args.verify,
         )
 
@@ -956,11 +1250,26 @@ class BenchmarkRunner:
                 )
             )
             self._phase_gap("verify_read")
-            phases.append(self._run_read_phase("verify_read", verify=True, sequential=True, loop=False))
+            phases.extend(
+                self._prepare_dfs_read_path(
+                    self.dataset.snapshot_prepared_ids(), "verify_read"
+                )
+            )
+            phases.append(
+                self._run_read_phase(
+                    "verify_read", verify=True, sequential=True, loop=False
+                )
+            )
             return phases
 
         if self.args.scenario == "fill":
             phases.append(self._run_fixed_write("fill_write", self._write_budget(), strict=False))
+            if self.args.wait_dfs_complete:
+                phases.append(
+                    self._wait_for_dfs_complete(
+                        self.dataset.snapshot_written_ids(), "dfs_complete_fill"
+                    )
+                )
             return phases
 
         if self.args.scenario == "write_perf":
@@ -969,12 +1278,23 @@ class BenchmarkRunner:
                 phases.append(self._run_time_based_write("write_perf", total_objects))
             else:
                 phases.append(self._run_fixed_write("write_perf", total_objects, strict=False))
+            if self.args.wait_dfs_complete:
+                phases.append(
+                    self._wait_for_dfs_complete(
+                        self.dataset.snapshot_written_ids(), "dfs_complete_write_perf"
+                    )
+                )
             return phases
 
         if self.args.scenario == "read_perf":
             prepared = self._maybe_prepare_dataset()
             if prepared is not None:
                 phases.append(prepared)
+            phases.extend(
+                self._prepare_dfs_read_path(
+                    self.dataset.snapshot_prepared_ids(), "read_perf"
+                )
+            )
             phases.append(
                 self._run_read_phase(
                     "read_perf",
@@ -989,6 +1309,11 @@ class BenchmarkRunner:
         prepared = self._maybe_prepare_dataset()
         if prepared is not None:
             phases.append(prepared)
+        phases.extend(
+            self._prepare_dfs_read_path(
+                self.dataset.snapshot_prepared_ids(), "mixed_rw"
+            )
+        )
         phases.append(self._run_mixed_phase("mixed_rw", self._write_budget()))
         return phases
 

@@ -59,10 +59,38 @@ with `register_buffer`.
 - The same `key-prefix`, `key-size`, and `object-id-start` produce the same key sequence
 - `verify` currently requires `pattern`
 - Any write-involved scenario requires `value-size` to be 512-byte aligned
-- `memory-replica-num` and `nof-replica-num` cannot both be `0`
+- `memory-replica-num`, `nof-replica-num`, and `dfs-replica-num` cannot all be `0`
+- `dfs-replica-num` currently supports `0` or `1`
+- `dfs-replica-num=1` requires `memory-replica-num > 0`
+- `--force-dfs-read` expects `memory-replica-num=1`, `nof-replica-num=0`, and `dfs-replica-num=1`
 - `prepare-objects`
   - Controls how many objects are written by the prepare phase
   - `0` means reuse `nr-objects`
+
+## DFS Modes
+
+For DFS end-to-end runs, start `mooncake_master` with:
+
+```bash
+export MOONCAKE_ENABLE_DFS=1
+export MOONCAKE_DFS_FS_ADAPTER=posix      # or hf3fs
+export MOONCAKE_DFS_ROOT_DIR=/tmp/mooncake_posix_dfs_bench
+export MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=distributed_storage_backend
+```
+
+When using 3FS, build with `USE_3FS=ON` and run on the node that has the HF3FS
+FUSE mount:
+
+```bash
+export MOONCAKE_DFS_FS_ADAPTER=hf3fs
+export MOONCAKE_DFS_ROOT_DIR=/mnt/3fs/mooncake_test/mooncake_hf3fs_bench
+```
+
+`--wait-dfs-complete` polls replica descriptors until every written key has a
+`COMPLETE` DFS replica. `--force-dfs-read` additionally waits
+`--dfs-clear-delay-sec`, clears the local MEMORY replica with
+`batch_replica_clear(segment_name=store.get_hostname())`, and then starts the
+read phase so the prepared objects are served from DFS.
 
 ## Phase Gap
 
@@ -183,6 +211,62 @@ In `mixed_rw`, reads are served from the prepared object set, while writes
 always use fresh object ids. This keeps the workload as "existing-object read +
 new-object write" and avoids key overlap between the read and write streams.
 
+### 5. POSIX DFS write performance
+
+Start the master with `MOONCAKE_DFS_FS_ADAPTER=posix` and
+`MOONCAKE_DFS_ROOT_DIR=/tmp/mooncake_posix_dfs_bench`, then run:
+
+```bash
+python3 mooncake-store/benchmarks/store_kv_bench.py \
+  --scenario write_perf \
+  --io-api plain \
+  --local-hostname 127.0.0.1:50071 \
+  --metadata-server http://127.0.0.1:8080/metadata \
+  --master-server 127.0.0.1:50051 \
+  --protocol tcp \
+  --nr-objects 4096 \
+  --batch-size 32 \
+  --runtime 30 \
+  --key-prefix posixdfs \
+  --key-size 24 \
+  --value-size $((128*1024)) \
+  --memory-replica-num 1 \
+  --nof-replica-num 0 \
+  --dfs-replica-num 1 \
+  --wait-dfs-complete
+```
+
+### 6. 3FS DFS forced-read performance
+
+Inside the 3FS runner container, use the HF3FS mount as the DFS root:
+
+```bash
+export MOONCAKE_DFS_FS_ADAPTER=hf3fs
+export MOONCAKE_DFS_ROOT_DIR=/mnt/3fs/mooncake_test/mooncake_hf3fs_bench
+
+python3 mooncake-store/benchmarks/store_kv_bench.py \
+  --scenario read_perf \
+  --prepare-mode auto \
+  --io-api plain \
+  --local-hostname 127.0.0.1:50071 \
+  --metadata-server http://127.0.0.1:8080/metadata \
+  --master-server 127.0.0.1:50051 \
+  --protocol tcp \
+  --nr-objects 4096 \
+  --batch-size 32 \
+  --runtime 30 \
+  --key-prefix hf3fsdfs \
+  --key-size 24 \
+  --value-size $((128*1024)) \
+  --memory-replica-num 1 \
+  --nof-replica-num 0 \
+  --dfs-replica-num 1 \
+  --force-dfs-read \
+  --dfs-clear-delay-sec 1 \
+  --verify \
+  --pattern 0xee
+```
+
 ## Output
 
 Each phase prints:
@@ -200,5 +284,6 @@ Each phase prints:
 - `lat_p95`
 - `lat_p99`
 - aggregated error counts
+- DFS completion and local-replica-clear phases when requested
 
 An overall summary is printed after all phases complete.

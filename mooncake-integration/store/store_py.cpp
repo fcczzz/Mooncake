@@ -1866,6 +1866,13 @@ PYBIND11_MODULE(store, m) {
         .def_readwrite("file_path", &DiskDescriptor::file_path)
         .def_readwrite("object_size", &DiskDescriptor::object_size);
 
+    py::class_<DistributedFSDescriptor>(m, "DistributedFSDescriptor")
+        .def_readwrite("file_path", &DistributedFSDescriptor::file_path)
+        .def_readwrite("offset", &DistributedFSDescriptor::offset)
+        .def_readwrite("object_size", &DistributedFSDescriptor::object_size)
+        .def_readwrite("aligned_size", &DistributedFSDescriptor::aligned_size)
+        .def_readwrite("shard_idx", &DistributedFSDescriptor::shard_idx);
+
     py::class_<Replica::Descriptor>(m, "ReplicaDescriptor")
         .def_readonly("status", &Replica::Descriptor::status)
         .def("is_memory_replica",
@@ -1877,6 +1884,9 @@ PYBIND11_MODULE(store, m) {
         .def("is_local_disk_replica",
              static_cast<bool (Replica::Descriptor::*)() const noexcept>(
                  &Replica::Descriptor::is_local_disk_replica))
+        .def("is_dfs_replica",
+             static_cast<bool (Replica::Descriptor::*)() const noexcept>(
+                 &Replica::Descriptor::is_dfs_replica))
         .def(
             "get_memory_descriptor",
             static_cast<const MemoryDescriptor &(Replica::Descriptor::*)()
@@ -1886,6 +1896,12 @@ PYBIND11_MODULE(store, m) {
             "get_disk_descriptor",
             static_cast<const DiskDescriptor &(Replica::Descriptor::*)() const>(
                 &Replica::Descriptor::get_disk_descriptor),
+            py::return_value_policy::reference_internal)
+        .def(
+            "get_dfs_descriptor",
+            static_cast<const DistributedFSDescriptor &(
+                Replica::Descriptor::*)() const>(
+                &Replica::Descriptor::get_dfs_descriptor),
             py::return_value_policy::reference_internal);
 
     py::class_<AllocatedBuffer::Descriptor>(
