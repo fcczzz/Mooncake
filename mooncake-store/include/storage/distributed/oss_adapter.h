@@ -31,6 +31,7 @@ class OssObjectStorageAdapter : public ObjectStorageAdapter {
     tl::expected<std::vector<KeyInfo>, ErrorCode> ListKeys() override;
 
     tl::expected<void, ErrorCode> Init() override;
+    tl::expected<void, ErrorCode> CheckHealth() override;
     const char* GetName() const override { return "oss"; }
 
     // OSS-specific operations that are intentionally not part of the common

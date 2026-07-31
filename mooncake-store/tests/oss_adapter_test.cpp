@@ -69,9 +69,15 @@ class ObjectCleanup {
     std::vector<std::string> keys_;
 };
 
-class PaginationServer {
+class ScriptedOssServer {
    public:
-    PaginationServer() {
+    struct Response {
+        long status;
+        std::string body;
+    };
+
+    explicit ScriptedOssServer(std::vector<Response> responses)
+        : responses_(std::move(responses)) {
         listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
         if (listen_fd_ < 0) throw std::runtime_error("socket failed");
 
@@ -100,7 +106,7 @@ class PaginationServer {
         thread_ = std::thread([this] { Serve(); });
     }
 
-    ~PaginationServer() {
+    ~ScriptedOssServer() {
         if (listen_fd_ >= 0) close(listen_fd_);
         if (thread_.joinable()) thread_.join();
     }
@@ -138,23 +144,7 @@ class PaginationServer {
     }
 
     void Serve() {
-        const std::array<std::string, 2> bodies = {
-            "<ListBucketResult>"
-            "<EncodingType>url</EncodingType>"
-            "<IsTruncated>true</IsTruncated>"
-            "<Contents><Key>test-prefix%2Falpha%252Fbeta</Key>"
-            "<Size>3</Size></Contents>"
-            "<NextContinuationToken>next%2Btoken</NextContinuationToken>"
-            "</ListBucketResult>",
-            "<ListBucketResult>"
-            "<EncodingType>url</EncodingType>"
-            "<IsTruncated>false</IsTruncated>"
-            "<Contents><Key>test-prefix%2Fpercent%2525value</Key>"
-            "<Size>5</Size></Contents>"
-            "</ListBucketResult>",
-        };
-
-        for (const auto& body : bodies) {
+        for (const auto& response : responses_) {
             pollfd descriptor{listen_fd_, POLLIN, 0};
             if (poll(&descriptor, 1, 5000) <= 0) {
                 error_ = "timed out waiting for OSS request";
@@ -166,12 +156,18 @@ class PaginationServer {
                 return;
             }
             requests_.push_back(ReadRequest(client));
-            const std::string response =
-                "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\n"
+            const std::string status_text =
+                response.status == 204   ? "No Content"
+                : response.status == 206 ? "Partial Content"
+                                         : "OK";
+            const std::string response_data =
+                "HTTP/1.1 " + std::to_string(response.status) + " " +
+                status_text +
+                "\r\nContent-Type: application/xml\r\n"
                 "Content-Length: " +
-                std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" +
-                body;
-            if (!SendAll(client, response)) error_ = "send failed";
+                std::to_string(response.body.size()) +
+                "\r\nConnection: close\r\n\r\n" + response.body;
+            if (!SendAll(client, response_data)) error_ = "send failed";
             close(client);
             if (!error_.empty()) return;
         }
@@ -182,6 +178,7 @@ class PaginationServer {
     int listen_fd_ = -1;
     uint16_t port_ = 0;
     std::thread thread_;
+    std::vector<Response> responses_;
     std::vector<std::string> requests_;
     std::string error_;
 };
@@ -243,7 +240,23 @@ TEST(OssObjectStorageAdapterTest, ValidatesVectorAndRangeArguments) {
 }
 
 TEST(OssObjectStorageAdapterTest, DecodesPaginatedLogicalKeys) {
-    PaginationServer server;
+    ScriptedOssServer server({
+        {200,
+         "<ListBucketResult>"
+         "<EncodingType>url</EncodingType>"
+         "<IsTruncated>true</IsTruncated>"
+         "<Contents><Key>test-prefix%2Falpha%252Fbeta</Key>"
+         "<Size>3</Size></Contents>"
+         "<NextContinuationToken>next%2Btoken</NextContinuationToken>"
+         "</ListBucketResult>"},
+        {200,
+         "<ListBucketResult>"
+         "<EncodingType>url</EncodingType>"
+         "<IsTruncated>false</IsTruncated>"
+         "<Contents><Key>test-prefix%2Fpercent%2525value</Key>"
+         "<Size>5</Size></Contents>"
+         "</ListBucketResult>"},
+    });
     ScopedEnvironment environment;
     environment.Set("MOONCAKE_OSS_ENDPOINT",
                     "http://127.0.0.1:" + std::to_string(server.port()));
@@ -269,6 +282,63 @@ TEST(OssObjectStorageAdapterTest, DecodesPaginatedLogicalKeys) {
               std::string::npos);
     EXPECT_NE(server.requests()[1].find("continuation-token=next%2Btoken"),
               std::string::npos);
+}
+
+TEST(OssObjectStorageAdapterTest, HealthCheckWritesReadsAndDeletesProbe) {
+    ScriptedOssServer server({
+        {200, ""},
+        {206, "health_check"},
+        {204, ""},
+    });
+    ScopedEnvironment environment;
+    environment.Set("MOONCAKE_OSS_ENDPOINT",
+                    "http://127.0.0.1:" + std::to_string(server.port()));
+    environment.Set("MOONCAKE_OSS_BUCKET", "bucket");
+    environment.Set("MOONCAKE_OSS_REGION", "region");
+    environment.Set("MOONCAKE_OSS_PATH_STYLE", "true");
+    environment.Set("MOONCAKE_OSS_ANONYMOUS", "true");
+
+    OssObjectStorageAdapter adapter("/test-prefix/");
+    ASSERT_TRUE(adapter.Init());
+    ASSERT_TRUE(adapter.CheckHealth());
+    server.Wait();
+    ASSERT_TRUE(server.error().empty()) << server.error();
+
+    ASSERT_EQ(server.requests().size(), 3U);
+    EXPECT_EQ(server.requests()[0].rfind("PUT ", 0), 0U);
+    EXPECT_EQ(server.requests()[1].rfind("GET ", 0), 0U);
+    EXPECT_EQ(server.requests()[2].rfind("DELETE ", 0), 0U);
+    EXPECT_NE(server.requests()[0].find(
+                  "/bucket/test-prefix/.mooncake_health_probe_"),
+              std::string::npos);
+    EXPECT_NE(server.requests()[1].find("Range: bytes=0-11"),
+              std::string::npos);
+}
+
+TEST(OssObjectStorageAdapterTest, HealthCheckCleansUpAfterReadMismatch) {
+    ScriptedOssServer server({
+        {200, ""},
+        {206, "wrong_health"},
+        {204, ""},
+    });
+    ScopedEnvironment environment;
+    environment.Set("MOONCAKE_OSS_ENDPOINT",
+                    "http://127.0.0.1:" + std::to_string(server.port()));
+    environment.Set("MOONCAKE_OSS_BUCKET", "bucket");
+    environment.Set("MOONCAKE_OSS_REGION", "region");
+    environment.Set("MOONCAKE_OSS_PATH_STYLE", "true");
+    environment.Set("MOONCAKE_OSS_ANONYMOUS", "true");
+
+    OssObjectStorageAdapter adapter("/test-prefix/");
+    ASSERT_TRUE(adapter.Init());
+    auto result = adapter.CheckHealth();
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    server.Wait();
+    ASSERT_TRUE(server.error().empty()) << server.error();
+
+    ASSERT_EQ(server.requests().size(), 3U);
+    EXPECT_EQ(server.requests()[2].rfind("DELETE ", 0), 0U);
 }
 
 TEST(OssObjectStorageAdapterTest, ObjectLifecycleAndVectorIO) {
@@ -334,13 +404,20 @@ TEST(OssObjectStorageAdapterTest, ObjectLifecycleAndVectorIO) {
     EXPECT_FALSE(*exists);
 }
 
-TEST(OssObjectStorageAdapterTest, StorageBackendFactorySelectsObjectMode) {
-    if (!HasOssConfiguration()) {
-        GTEST_SKIP() << "OSS configuration is not available";
-    }
-
+TEST(OssObjectStorageAdapterTest, StorageBackendFactoryRunsObjectHealthCheck) {
+    ScriptedOssServer server({
+        {200, ""},
+        {206, "health_check"},
+        {204, ""},
+    });
     ScopedEnvironment environment;
     const std::string root = UniquePrefix("factory");
+    environment.Set("MOONCAKE_OSS_ENDPOINT",
+                    "http://127.0.0.1:" + std::to_string(server.port()));
+    environment.Set("MOONCAKE_OSS_BUCKET", "bucket");
+    environment.Set("MOONCAKE_OSS_REGION", "region");
+    environment.Set("MOONCAKE_OSS_PATH_STYLE", "true");
+    environment.Set("MOONCAKE_OSS_ANONYMOUS", "true");
     environment.Set("MOONCAKE_DISTRIBUTED_FS_TYPE", "oss");
     environment.Set("MOONCAKE_DISTRIBUTED_ROOT_DIR", root);
     environment.Set("MOONCAKE_DISTRIBUTED_HEALTH_CHECK", "true");
@@ -355,6 +432,13 @@ TEST(OssObjectStorageAdapterTest, StorageBackendFactorySelectsObjectMode) {
     ASSERT_NE(distributed, nullptr);
     EXPECT_TRUE(distributed->UsesObjectStorage());
     ASSERT_TRUE(distributed->Init());
+    server.Wait();
+    ASSERT_TRUE(server.error().empty()) << server.error();
+
+    ASSERT_EQ(server.requests().size(), 3U);
+    EXPECT_EQ(server.requests()[0].rfind("PUT ", 0), 0U);
+    EXPECT_EQ(server.requests()[1].rfind("GET ", 0), 0U);
+    EXPECT_EQ(server.requests()[2].rfind("DELETE ", 0), 0U);
 }
 
 }  // namespace

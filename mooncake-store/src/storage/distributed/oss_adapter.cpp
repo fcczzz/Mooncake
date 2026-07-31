@@ -261,6 +261,41 @@ tl::expected<void, ErrorCode> OssObjectStorageAdapter::Init() {
     return {};
 }
 
+tl::expected<void, ErrorCode> OssObjectStorageAdapter::CheckHealth() {
+    const std::string probe_key =
+        ".mooncake_health_probe_" + UuidToString(generate_uuid());
+    const std::string probe_data = "health_check";
+
+    auto write_result = Put(
+        probe_key, std::span<const char>(probe_data.data(), probe_data.size()));
+    if (!write_result) {
+        LOG(ERROR) << "OSS health check failed to write probe: "
+                   << static_cast<int>(write_result.error());
+        return write_result;
+    }
+
+    auto cleanup_probe = [&] {
+        auto delete_result = Delete(probe_key);
+        if (!delete_result) {
+            LOG(WARNING) << "Failed to delete OSS health-check probe: "
+                         << static_cast<int>(delete_result.error());
+        }
+    };
+
+    std::string read_buffer(probe_data.size(), '\0');
+    auto read_result = Get(probe_key, read_buffer.data(), read_buffer.size());
+    if (!read_result || *read_result != probe_data.size() ||
+        read_buffer != probe_data) {
+        LOG(ERROR) << "OSS health check failed to read back probe";
+        cleanup_probe();
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    }
+
+    cleanup_probe();
+    LOG(INFO) << "OSS health check passed";
+    return {};
+}
+
 std::string OssObjectStorageAdapter::PhysicalPrefix() const {
     return key_prefix_.empty() ? std::string() : key_prefix_ + "/";
 }
