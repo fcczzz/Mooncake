@@ -99,7 +99,6 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
         config.storage_backend_type = StorageBackendType::kOffsetAllocator;
     } else if (storage_backend_descriptor == "distributed_storage_backend") {
         config.storage_backend_type = StorageBackendType::kDistributed;
-        config.enable_dfs = true;
     } else {
         LOG(ERROR) << "Unknown storage backend.";
     }
@@ -274,10 +273,7 @@ FileStorage::FileStorage(const FileStorageConfig& config,
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
       client_buffer_allocator_(AlignedClientBufferAllocator::create(
           config.local_buffer_size, client ? client->GetProtocol() : "")) {
-    if (config_.storage_backend_type == StorageBackendType::kDistributed) {
-        config_.enable_dfs = true;
-    }
-    if (!config.Validate()) {
+    if (!config_.Validate()) {
         throw std::invalid_argument("Invalid FileStorage configuration");
     }
 
@@ -314,7 +310,8 @@ FileStorage::FileStorage(const FileStorageConfig& config,
     if (auto distributed_backend =
             std::dynamic_pointer_cast<DistributedStorageBackend>(
                 storage_backend_)) {
-        if (client_) {
+        config_.enable_dfs = !distributed_backend->UsesObjectStorage();
+        if (config_.enable_dfs && client_) {
             client_->SetDfsStorageBackend(distributed_backend);
         }
     }
