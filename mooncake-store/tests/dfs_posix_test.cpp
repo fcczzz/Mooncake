@@ -61,6 +61,8 @@ class EnvGuard {
         Save("MOONCAKE_DFS_EVICTION_LOW_WATERMARK");
         Save("MOONCAKE_DFS_DEFERRED_FREE_SECONDS");
         Save("MOONCAKE_DFS_EVICTION_CHECK_INTERVAL");
+        Save("MOONCAKE_DFS_METADATA_CHECKPOINT_INTERVAL_SECONDS");
+        Save("MOONCAKE_DFS_METADATA_WAL_MAX_BYTES");
         Save("MOONCAKE_DFS_ROOT_DIR");
         Save("MOONCAKE_DFS_SHARD_COUNT");
         Save("MOONCAKE_DFS_SHARD_CAPACITY");
@@ -304,6 +306,22 @@ TEST_F(FsAdapterFdTest, PreallocateLargeSparseFile) {
     adapter_->CloseFile(*fd);
 }
 
+TEST_F(FsAdapterFdTest, DurableMetadataReplaceAndAppend) {
+    const std::string path = tmp_->file("allocator.meta");
+    const std::string first = "checkpoint-one";
+    ASSERT_TRUE(adapter_->AtomicWriteFile(path, first).has_value());
+    const std::string second = "checkpoint-two";
+    ASSERT_TRUE(adapter_->AtomicWriteFile(path, second).has_value());
+    const std::string suffix = "-wal";
+    ASSERT_TRUE(adapter_->AppendAndSyncFile(path, suffix).has_value());
+
+    std::string contents(second.size() + suffix.size(), '\0');
+    ASSERT_TRUE(
+        adapter_->ReadFile(path, contents.data(), contents.size()).has_value());
+    EXPECT_EQ(contents, second + suffix);
+    EXPECT_FALSE(std::filesystem::exists(path + ".tmp"));
+}
+
 TEST(DfsGlobalAllocatorTest, AllocateFreeAndFormatShardIdx) {
     EnvGuard env;
     ConfigurePosixDfs(env);
@@ -345,6 +363,8 @@ TEST(DistributedStorageConfigTest, ReadsValidatesAndFormatsEnvironment) {
     env.Set("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.65");
     env.Set("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "12");
     env.Set("MOONCAKE_DFS_EVICTION_CHECK_INTERVAL", "3");
+    env.Set("MOONCAKE_DFS_METADATA_CHECKPOINT_INTERVAL_SECONDS", "17");
+    env.Set("MOONCAKE_DFS_METADATA_WAL_MAX_BYTES", "123456");
 
     const auto config = DistributedStorageConfig::FromEnvironment();
     EXPECT_EQ(config.fsdir, tmp.path());
@@ -357,6 +377,8 @@ TEST(DistributedStorageConfigTest, ReadsValidatesAndFormatsEnvironment) {
     EXPECT_DOUBLE_EQ(config.eviction_low_watermark, 0.65);
     EXPECT_EQ(config.deferred_free_duration, std::chrono::seconds(12));
     EXPECT_EQ(config.eviction_check_interval, std::chrono::seconds(3));
+    EXPECT_EQ(config.metadata_checkpoint_interval, std::chrono::seconds(17));
+    EXPECT_EQ(config.metadata_wal_max_bytes, 123456);
     EXPECT_TRUE(config.Validate());
     EXPECT_TRUE(config.ValidateForAllocator());
 
@@ -370,6 +392,165 @@ TEST(DistributedStorageConfigTest, ReadsValidatesAndFormatsEnvironment) {
     invalid_eviction.eviction_low_watermark = 0.9;
     EXPECT_TRUE(invalid_eviction.Validate());
     EXPECT_FALSE(invalid_eviction.ValidateForAllocator());
+
+    auto oversized_wal = config;
+    oversized_wal.metadata_wal_max_bytes = 512ULL * 1024 * 1024 + 1;
+    EXPECT_FALSE(oversized_wal.ValidateForAllocator());
+}
+
+TEST(DfsGlobalAllocatorRecoveryTest, AllocationSurvivesRestartWithoutOverlap) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_recover_alloc");
+    const auto config =
+        MakeAllocatorConfig(tmp.path(), 1, 32 * 1024, 4096);
+
+    DistributedFSDescriptor first;
+    {
+        DfsGlobalAllocator allocator;
+        ASSERT_TRUE(allocator.Init(config));
+        auto allocated = allocator.Allocate("first", 100);
+        ASSERT_TRUE(allocated.has_value());
+        first = *allocated;
+    }
+
+    DfsGlobalAllocator recovered;
+    ASSERT_TRUE(recovered.Init(config));
+    EXPECT_TRUE(recovered.ValidateAllocation("first", first).has_value());
+    auto second = recovered.Allocate("second", 100);
+    ASSERT_TRUE(second.has_value());
+    EXPECT_NE(second->offset, first.offset);
+}
+
+TEST(DfsGlobalAllocatorRecoveryTest, DurableReleaseSurvivesRestart) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_recover_release");
+    const auto config =
+        MakeAllocatorConfig(tmp.path(), 1, 8 * 1024, 4096);
+
+    DistributedFSDescriptor released;
+    {
+        DfsGlobalAllocator allocator;
+        ASSERT_TRUE(allocator.Init(config));
+        auto allocated = allocator.Allocate("released", 100);
+        ASSERT_TRUE(allocated.has_value());
+        released = *allocated;
+        allocator.Free(released.offset, released.aligned_size,
+                       released.shard_idx, "released");
+        ASSERT_TRUE(allocator.RunMaintenance().has_value());
+    }
+
+    DfsGlobalAllocator recovered;
+    ASSERT_TRUE(recovered.Init(config));
+    EXPECT_FALSE(
+        recovered.ValidateAllocation("released", released).has_value());
+    auto replacement = recovered.Allocate("replacement", 100);
+    ASSERT_TRUE(replacement.has_value());
+    EXPECT_EQ(replacement->offset, released.offset);
+}
+
+TEST(DfsGlobalAllocatorRecoveryTest, TornWalTailIsQuarantinedByCompaction) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_recover_torn_wal");
+    const auto config =
+        MakeAllocatorConfig(tmp.path(), 1, 32 * 1024, 4096);
+
+    DistributedFSDescriptor descriptor;
+    {
+        DfsGlobalAllocator allocator;
+        ASSERT_TRUE(allocator.Init(config));
+        auto allocated = allocator.Allocate("survivor", 100);
+        ASSERT_TRUE(allocated.has_value());
+        descriptor = *allocated;
+    }
+
+    const std::string wal = tmp.file("dfs_shard_00.wal");
+    const int fd = ::open(wal.c_str(), O_WRONLY | O_APPEND);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(::write(fd, "torn", 4), 4);
+    ASSERT_EQ(::fsync(fd), 0);
+    ASSERT_EQ(::close(fd), 0);
+
+    DfsGlobalAllocator recovered;
+    ASSERT_TRUE(recovered.Init(config));
+    EXPECT_TRUE(
+        recovered.ValidateAllocation("survivor", descriptor).has_value());
+    EXPECT_EQ(std::filesystem::file_size(wal), 40);
+}
+
+TEST(DfsGlobalAllocatorRecoveryTest, OrphanWaitsForRecoveryBarrierAndRelease) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_recover_orphan");
+    const auto config =
+        MakeAllocatorConfig(tmp.path(), 1, 8 * 1024, 4096);
+    {
+        DfsGlobalAllocator allocator;
+        ASSERT_TRUE(allocator.Init(config));
+        ASSERT_TRUE(allocator.Allocate("orphan", 100).has_value());
+    }
+
+    DfsGlobalAllocator recovered;
+    ASSERT_TRUE(recovered.Init(config, true));
+    EXPECT_FALSE(recovered.Allocate("blocked", 100).has_value());
+    ASSERT_TRUE(recovered.CompleteRecovery({}).has_value());
+    ASSERT_TRUE(recovered.RunMaintenance().has_value());
+    EXPECT_TRUE(recovered.Allocate("replacement", 100).has_value());
+}
+
+TEST(DfsGlobalAllocatorRecoveryTest, CorruptCheckpointFailsClosed) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_recover_corrupt");
+    const auto config =
+        MakeAllocatorConfig(tmp.path(), 1, 32 * 1024, 4096);
+    {
+        DfsGlobalAllocator allocator;
+        ASSERT_TRUE(allocator.Init(config));
+        ASSERT_TRUE(allocator.Allocate("key", 100).has_value());
+        ASSERT_TRUE(allocator.Checkpoint().has_value());
+    }
+    const std::string meta = tmp.file("dfs_shard_00.meta");
+    const int fd = ::open(meta.c_str(), O_WRONLY | O_TRUNC);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(::write(fd, "bad", 3), 3);
+    ASSERT_EQ(::close(fd), 0);
+
+    DfsGlobalAllocator recovered;
+    EXPECT_FALSE(recovered.Init(config).has_value());
+}
+
+TEST(DfsGlobalAllocatorRecoveryTest, NamespaceMismatchFailsClosed) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_recover_namespace");
+    auto config = MakeAllocatorConfig(tmp.path(), 1, 32 * 1024, 4096);
+    config.metadata_namespace = "cluster-a";
+    {
+        DfsGlobalAllocator allocator;
+        ASSERT_TRUE(allocator.Init(config));
+    }
+
+    config.metadata_namespace = "cluster-b";
+    DfsGlobalAllocator recovered;
+    EXPECT_FALSE(recovered.Init(config).has_value());
+}
+
+TEST(DfsGlobalAllocatorRecoveryTest, PhaseOneDirectoryFailsClosed) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_phase_one_dir");
+    const std::string data = tmp.file("dfs_shard_00.data");
+    const int fd = ::open(data.c_str(), O_CREAT | O_WRONLY, 0600);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(::ftruncate(fd, 32 * 1024), 0);
+    ASSERT_EQ(::close(fd), 0);
+
+    DfsGlobalAllocator allocator;
+    EXPECT_FALSE(allocator.Init(
+        MakeAllocatorConfig(tmp.path(), 1, 32 * 1024, 4096)));
 }
 
 TEST(DfsGlobalAllocatorTest, InitReturnsSpecificErrors) {
@@ -610,6 +791,33 @@ TEST(DfsGlobalAllocatorTest, StaleFreeDoesNotReleaseReusedOffset) {
     auto evicted = PrepareAndCommitPreparedEviction(alloc);
     ASSERT_EQ(evicted.size(), 1);
     EXPECT_EQ(evicted.front().key, "B");
+}
+
+TEST(DfsGlobalAllocatorTest, StaleFreeSizeDoesNotReleaseSameKeyReuse) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_stale_free_same_key");
+
+    DfsGlobalAllocator alloc;
+    ASSERT_TRUE(
+        alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 16 * 1024, 4096)));
+
+    auto old_descriptor = alloc.Allocate("same-key", 100);
+    ASSERT_TRUE(old_descriptor.has_value());
+    alloc.Free(old_descriptor->offset, old_descriptor->aligned_size,
+               old_descriptor->shard_idx, "same-key");
+    ASSERT_TRUE(alloc.RunMaintenance().has_value());
+
+    auto current_descriptor = alloc.Allocate("same-key", 5000);
+    ASSERT_TRUE(current_descriptor.has_value());
+    ASSERT_EQ(current_descriptor->offset, old_descriptor->offset);
+    ASSERT_NE(current_descriptor->aligned_size,
+              old_descriptor->aligned_size);
+
+    alloc.Free(old_descriptor->offset, old_descriptor->aligned_size,
+               old_descriptor->shard_idx, "same-key");
+    EXPECT_TRUE(alloc.ValidateAllocation("same-key", *current_descriptor)
+                    .has_value());
 }
 
 TEST(DfsGlobalAllocatorTest, ConcurrentAllocate) {

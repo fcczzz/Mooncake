@@ -76,6 +76,7 @@ bool DistributedStorageConfig::Validate() const {
 }
 
 bool DistributedStorageConfig::ValidateForAllocator() const {
+    constexpr uint64_t kMaxMetadataWalBytes = 512ULL * 1024 * 1024;
     if (!Validate()) return false;
 
     if (eviction_low_watermark < 0.0 || eviction_low_watermark > 1.0 ||
@@ -97,6 +98,14 @@ bool DistributedStorageConfig::ValidateForAllocator() const {
         LOG(ERROR) << "DistributedStorageConfig: eviction_check_interval must "
                       "be positive when eviction is enabled, seconds="
                    << eviction_check_interval.count();
+        return false;
+    }
+    if (metadata_checkpoint_interval.count() <= 0 ||
+        metadata_wal_max_bytes == 0 ||
+        metadata_wal_max_bytes > kMaxMetadataWalBytes) {
+        LOG(ERROR) << "DistributedStorageConfig: DFS metadata checkpoint "
+                      "interval must be positive and WAL size must be in "
+                      "[1, 536870912]";
         return false;
     }
     return true;
@@ -136,6 +145,12 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
     config.eviction_check_interval = std::chrono::seconds(Environ::GetInt(
         "MOONCAKE_DFS_EVICTION_CHECK_INTERVAL",
         static_cast<int>(config.eviction_check_interval.count())));
+    config.metadata_checkpoint_interval = std::chrono::seconds(Environ::GetInt(
+        "MOONCAKE_DFS_METADATA_CHECKPOINT_INTERVAL_SECONDS",
+        static_cast<int>(config.metadata_checkpoint_interval.count())));
+    config.metadata_wal_max_bytes = Environ::GetUInt64(
+        "MOONCAKE_DFS_METADATA_WAL_MAX_BYTES",
+        config.metadata_wal_max_bytes);
     return config;
 }
 
@@ -151,7 +166,10 @@ std::string DistributedStorageConfig::FormatStr() const {
         << ", eviction_low_watermark=" << eviction_low_watermark
         << ", deferred_free_seconds=" << deferred_free_duration.count()
         << ", eviction_check_interval_seconds="
-        << eviction_check_interval.count();
+        << eviction_check_interval.count()
+        << ", metadata_checkpoint_interval_seconds="
+        << metadata_checkpoint_interval.count()
+        << ", metadata_wal_max_bytes=" << metadata_wal_max_bytes;
     return oss.str();
 }
 

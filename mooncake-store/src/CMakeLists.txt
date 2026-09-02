@@ -9,6 +9,7 @@ set(MOONCAKE_STORE_SHARED_SOURCES
     etcd_helper.cpp
     uds_transport.cpp
     storage/distributed/distributed_storage_backend.cpp
+    storage/distributed/fs_adapter.cpp
     storage/distributed/posix_fs_adapter.cpp
     utils/file_util.cpp)
 

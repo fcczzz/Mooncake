@@ -34,6 +34,10 @@ struct DistributedStorageConfig {
     double eviction_low_watermark = 0.7;
     std::chrono::seconds deferred_free_duration{30};
     std::chrono::seconds eviction_check_interval{5};
+    std::chrono::seconds metadata_checkpoint_interval{300};
+    uint64_t metadata_wal_max_bytes = 64ULL * 1024 * 1024;
+    // Master-only namespace included in allocator sidecar fingerprints.
+    std::string metadata_namespace;
 
     bool Validate() const;
     bool ValidateForAllocator() const;

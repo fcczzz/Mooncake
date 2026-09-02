@@ -698,8 +698,8 @@ SSD offload with `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` instead.
 ```{warning}
 **Work in progress.** Descriptor-based DFS is intended for development and
 evaluation only. It is not production-ready and is not covered by Mooncake
-Store's general fault-tolerance, HA continuity, durability, or multi-tenant
-guarantees.
+Store's general fault-tolerance, HA continuity, data-file `fsync` durability,
+or multi-tenant guarantees.
 ```
 
 Mooncake Store can place an additional replica in a shared distributed
@@ -712,12 +712,9 @@ DFS replicas are separate from `LOCAL_DISK` SSD-offload replicas. They do not
 use the legacy `--root_fs_dir` persistence path or the master's asynchronous
 offload task queue.
 
-```{note}
-DFS allocator state is not yet restored after a master restart or HA leader
-failover. Do not enable descriptor-based DFS in a deployment that requires
-master recovery, HA continuity, or multiple tenants. See the complete list of
-limitations below.
-```
+DFS allocator metadata is recovered after a standalone master restart and
+reconciled with ordinary snapshot restore. Descriptor-based DFS remains
+incompatible with HA, OpLog recovery, and standby promotion.
 
 #### Master configuration
 
@@ -736,11 +733,17 @@ export MOONCAKE_DFS_SINGLE_TENANT=true
 mooncake_master [other master arguments]
 ```
 
-At startup, the master creates `MOONCAKE_DFS_SHARD_COUNT` shard files and
-preallocates each file to `MOONCAKE_DFS_SHARD_CAPACITY`. The example therefore
-configures 256 GiB of total logical shard capacity (`64 * 4 GiB`). Ensure the
-shared filesystem has sufficient capacity; whether all backing space is
-reserved immediately depends on the selected filesystem adapter.
+At startup, the master creates a `.data`, `.meta`, and `.wal` file for every
+shard and preallocates each data file to `MOONCAKE_DFS_SHARD_CAPACITY`. The
+example therefore configures 256 GiB of total logical shard capacity
+(`64 * 4 GiB`). Ensure the shared filesystem has sufficient capacity; whether
+all backing space is reserved immediately depends on the selected filesystem
+adapter.
+
+An existing directory containing Phase-1 `.data` files without matching
+sidecars is rejected rather than guessed. Upgrade with a new empty root. Do not
+downgrade and reuse a Phase-2 root with an older master, because the older
+allocator does not read the sidecars.
 
 The `hf3fs` adapter requires Mooncake to be built with `USE_3FS=ON`. Use
 `MOONCAKE_DFS_FS_ADAPTER=posix` for development and integration testing on a
@@ -802,6 +805,8 @@ is required.
 | `MOONCAKE_DFS_EVICTION_LOW_WATERMARK` | Master | `0.7` | Usage ratio targeted by an eviction cycle. |
 | `MOONCAKE_DFS_DEFERRED_FREE_SECONDS` | Master | `30` | Delay before a freed shard range may be reused. |
 | `MOONCAKE_DFS_EVICTION_CHECK_INTERVAL` | Master | `5` | Eviction check interval in seconds. |
+| `MOONCAKE_DFS_METADATA_CHECKPOINT_INTERVAL_SECONDS` | Master | `300` | Maximum interval between WAL compactions into an allocator checkpoint. |
+| `MOONCAKE_DFS_METADATA_WAL_MAX_BYTES` | Master | `67108864` | WAL size that triggers checkpoint compaction. |
 
 #### Requesting and accessing DFS replicas
 
@@ -858,12 +863,12 @@ reads for that descriptor.
 - A DFS object must fit in its key-selected shard after alignment and allocator
   padding; objects are not striped and allocation does not fall back to another
   shard.
-- DFS allocator state is currently in memory. A master restart or HA leader
-  failover does not reconstruct existing DFS allocations, so DFS cannot provide
-  continuity across those events.
-- DFS cannot be enabled with snapshot generation, snapshot restore, oplog
-  recovery, or standby restore until DFS allocator state restoration is
-  implemented.
+- Snapshot restore prunes a DFS replica whose descriptor no longer matches the
+  allocator; if no other valid replica remains, the object is pruned too.
+- Descriptor-based DFS cannot be enabled with HA or OpLog recovery, and standby
+  restore continues to reject DFS mode.
+- Phase-1 DFS directories containing data files without allocator sidecars are
+  not migrated in place. Rollout and rollback require a new empty DFS root.
 - There is currently no background DFS retry queue or configurable
   asynchronous acknowledgement policy.
 - DFS writes currently have no DFS-specific timeout, request cancellation, or
